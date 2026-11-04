@@ -15,7 +15,7 @@ bench:
 	for i in 1 2 3; do \
 	  echo "--- Run $$i ---"; \
 	  start=$$(perl -MTime::HiRes=time -e 'printf "%.3f", time'); \
-	  ./bin/bench || exit 1; \
+	  ./bin/bench -p "Hello World" -n 20 --temp 0 || exit 1; \
 	  end=$$(perl -MTime::HiRes=time -e 'printf "%.3f", time'); \
 	  times="$$times $$(awk -v s=$$start -v e=$$end 'BEGIN {printf "%.3f", e - s}')"; \
 	done; \

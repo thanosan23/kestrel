@@ -7,6 +7,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -232,6 +233,7 @@ static int sample(const std::vector<float> &logits, float temperature,
   for (int i = 0; i < (int)logits.size(); i++) {
     candidates.push_back({logits[i], i});
   }
+
   int k =
       (top_k > 0 && top_k < (int)candidates.size() ? top_k
                                                    : (int)candidates.size());
@@ -245,15 +247,19 @@ static int sample(const std::vector<float> &logits, float temperature,
   for (int i = 0; i < k; i++) {
     probs[i] = std::exp((candidates[i].first - max_logit) / temperature);
   }
+
   std::discrete_distribution<int> pick(probs.begin(), probs.end());
   return candidates[pick(rng)].second;
 }
 
-static const char *usage = "Usage: ./bin/main [options]\n"
-                           " -p TEXT    prompt\n"
-                           " -n N       number of tokens to generate\n"
-                           " --temp T   temperature\n"
-                           " --top-k K  sample from K most likely tokens\n";
+static const char *usage =
+    "Usage: ./bin/main [options]\n"
+    " -p TEXT      prompt\n"
+    " -n N         number of tokens to generate\n"
+    " --temp T     temperature\n"
+    " --top-k K    sample from K most likely tokens\n"
+    " --dump FILE  save the prompt's token ids and logits"
+    " --help       prints usage\n";
 
 int main(int argc, char **argv) {
   using Clock = std::chrono::steady_clock;
@@ -266,6 +272,7 @@ int main(int argc, char **argv) {
   float temperature = 0.8f;
   int top_k = 40;
   unsigned seed = std::random_device{}();
+  std::string dump_path;
 
   for (int i = 1; i < argc; i++) {
     std::string arg = argv[i];
@@ -286,6 +293,9 @@ int main(int argc, char **argv) {
       top_k = std::stoi(value());
     else if (arg == "--seed") {
       seed = std::stoul(value());
+    } else if (arg == "--dump") {
+      dump_path = value();
+
     } else if (arg == "-h" || arg == "--help") {
       std::cout << usage;
       return 0;
@@ -325,6 +335,20 @@ int main(int argc, char **argv) {
     logits = model.step(tokens[pos], pos, cache);
   }
   double prompt_s = seconds_since(t1);
+
+  if (!dump_path.empty()) {
+    std::ofstream dump(dump_path, std::ios::binary);
+
+    const int32_t n = tokens.size();
+    dump.write(reinterpret_cast<const char *>(&n), sizeof(n));
+    dump.write(reinterpret_cast<const char *>(tokens.data()), sizeof(int) * n);
+    dump.write(reinterpret_cast<const char *>(logits.data()),
+               logits.size() * sizeof(float));
+    if (!dump) {
+      std::cerr << "could not write " << dump_path << '\n';
+      return 1;
+    }
+  }
 
   std::mt19937 rng(seed);
   constexpr int END_OF_TEXT = 50256;
