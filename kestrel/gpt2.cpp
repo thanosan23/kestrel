@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -20,6 +21,7 @@ constexpr int n_ctx = 1024;
 constexpr int V = 50257;
 } // namespace cfg
 
+// approximation from: https://arxiv.org/pdf/1606.08415
 static float gelu(float x) {
   const float sqrt_2_over_pi = 0.7978845608f;
   return 0.5f * x *
@@ -66,51 +68,40 @@ static void layernorm(float *out, const float *in, const float *gamma,
   }
 }
 
-static void causal_self_attention(float *out, const float *qkv, int T) {
+static void attention(float *out, const float *q, const float *K,
+                      const float *V, int pos) {
   using namespace cfg;
-  const float scale = 1.0 / std::sqrt((float)head_dim);
+  const float scale = 1.0f / std::sqrt((float)head_dim);
+  std::vector<float> probs(pos + 1);
 
-  auto query = [&](int t, int h) {
-    return qkv + t * 3 * C + 0 * C + h * head_dim;
-  };
-
-  auto key = [&](int t, int h) {
-    return qkv + t * 3 * C + 1 * C + h * head_dim;
-  };
-
-  auto value = [&](int t, int h) {
-    return qkv + t * 3 * C + 2 * C + h * head_dim;
-  };
-
-  std::vector<float> probs(T);
   for (int h = 0; h < n_head; h++) {
-    for (int t = 0; t < T; t++) {
-      const float *q = query(t, h);
-
-      float max_score = -INFINITY;
-      for (int t2 = 0; t2 <= t; t2++) {
-        const float *k = key(t2, h);
-        float dot = 0.0f;
-        for (int i = 0; i < head_dim; i++)
-          dot += q[i] * k[i];
-        probs[t2] = dot * scale;
-        max_score = std::max(max_score, probs[t2]);
+    const float *qh = q + h * head_dim;
+    float max_score = -INFINITY;
+    for (int t2 = 0; t2 <= pos; t2++) {
+      const float *kh = K + t2 * C + h * head_dim;
+      float dot = 0.0f;
+      for (int i = 0; i < head_dim; i++) {
+        dot += qh[i] * kh[i];
       }
+      probs[t2] = dot * scale;
+      max_score = std::max(max_score, probs[t2]);
+    }
 
-      float sum = 0.0f;
-      for (int t2 = 0; t2 <= t; t2++) {
-        probs[t2] = std::exp(probs[t2] - max_score);
-        sum += probs[t2];
-      }
-      for (int t2 = 0; t2 <= t; t2++)
-        probs[t2] /= sum;
+    float sum = 0.0f;
+    for (int t2 = 0; t2 <= pos; t2++) {
+      probs[t2] = std::exp(probs[t2] - max_score);
+      sum += probs[t2];
+    }
+    for (int t2 = 0; t2 <= pos; t2++) {
+      probs[t2] /= sum;
+    }
 
-      float *o = out + t * C + h * head_dim;
-      std::fill(o, o + head_dim, 0.0f);
-      for (int t2 = 0; t2 <= t; t2++) {
-        const float *v = value(t2, h);
-        for (int i = 0; i < head_dim; i++)
-          o[i] += probs[t2] * v[i];
+    float *o = out + h * head_dim;
+    std::fill(o, o + head_dim, 0.0f);
+    for (int t2 = 0; t2 <= pos; t2++) {
+      const float *vh = V + t2 * C + h * head_dim;
+      for (int i = 0; i < head_dim; i++) {
+        o[i] += probs[t2] * vh[i];
       }
     }
   }
@@ -122,42 +113,45 @@ static void add_inplace(std::vector<float> &x, const std::vector<float> &y) {
   }
 }
 
+struct KVCache {
+  std::vector<std::vector<float>> k, v;
+  KVCache()
+      : k(cfg::n_layer, std::vector<float>(cfg::n_ctx * cfg::C)),
+        v(cfg::n_layer, std::vector<float>(cfg::n_ctx * cfg::C)) {}
+};
+
 class GPT2 {
 public:
   explicit GPT2(std::map<std::string, Tensor> weights)
       : weights(std::move(weights)) {};
 
-  std::vector<float> next_token_logits(const std::vector<int> &tokens) const {
+  std::vector<float> step(int token, int pos, KVCache &cache) const {
     using namespace cfg;
 
-    const int T = tokens.size();
-    if (T == 0 || T > n_ctx) {
-      throw std::runtime_error("sequence length must be between 1 and 1024");
+    if (pos >= n_ctx) {
+      throw std::runtime_error("context is full");
     }
 
-    std::vector<float> x(T * C);
     const float *wte = param("wte.weight");
     const float *wpe = param("wpe.weight");
-    for (int t = 0; t < T; t++) {
-      for (int c = 0; c < C; c++) {
-        x[t * C + c] = wte[tokens[t] * C + c] + wpe[t * C + c];
-      }
+    std::vector<float> x(C);
+    for (int c = 0; c < C; c++) {
+      x[c] = wte[token * C + c] + wpe[pos * C + c];
     }
     for (int layer = 0; layer < n_layer; layer++) {
-      transformer_block(layer, x, T);
+      transformer_block(layer, x, pos, cache);
     }
 
-    std::vector<float> normed(T * C);
+    std::vector<float> normed(C);
     layernorm(normed.data(), x.data(), param("ln_f.weight"), param("ln_f.bias"),
-              T, C);
+              1, C);
 
-    const float *last = normed.data() + (T - 1) * C;
     std::vector<float> logits(V);
     for (int v = 0; v < V; v++) {
       const float *emb = wte + v * C;
       float dot = 0.0f;
       for (int c = 0; c < C; c++)
-        dot += last[c] * emb[c];
+        dot += normed[c] * emb[c];
       logits[v] = dot;
     }
     return logits;
@@ -174,37 +168,42 @@ private:
     return param("h." + std::to_string(layer) + "." + name);
   }
 
-  void transformer_block(int layer, std::vector<float> &x, int T) const {
+  void transformer_block(int layer, std::vector<float> &x, int pos,
+                         KVCache &cache) const {
     using namespace cfg;
 
-    std::vector<float> normed(T * C), qkv(T * 3 * C), attn(T * C),
-        hidden(T * 4 * C), out(T * C);
+    std::vector<float> normed(C), qkv(3 * C), attn(C), hidden(4 * C), out(C);
 
     layernorm(normed.data(), x.data(), param(layer, "ln_1.weight"),
-              param(layer, "ln_1.bias"), T, C);
+              param(layer, "ln_1.bias"), 1, C);
 
     linear(qkv.data(), normed.data(), param(layer, "attn.c_attn.weight"),
-           param(layer, "attn.c_attn.bias"), T, C,
-           3 * C); // [T, C] -> [T, 3*C]
+           param(layer, "attn.c_attn.bias"), 1, C, 3 * C);
 
-    causal_self_attention(attn.data(), qkv.data(), T); // [T, 3C] --> [T, C]
+    float *K = cache.k[layer].data();
+    float *V = cache.v[layer].data();
+
+    std::copy(qkv.begin() + C, qkv.begin() + 2 * C, K + pos * C);
+    std::copy(qkv.begin() + 2 * C, qkv.end(), V + pos * C);
+
+    attention(attn.data(), qkv.data(), K, V, pos);
 
     linear(out.data(), attn.data(), param(layer, "attn.c_proj.weight"),
-           param(layer, "attn.c_proj.bias"), T, C, C);
+           param(layer, "attn.c_proj.bias"), 1, C, C);
 
     add_inplace(x, out);
 
     layernorm(normed.data(), x.data(), param(layer, "ln_2.weight"),
-              param(layer, "ln_2.bias"), T, C);
+              param(layer, "ln_2.bias"), 1, C);
 
     linear(hidden.data(), normed.data(), param(layer, "mlp.c_fc.weight"),
-           param(layer, "mlp.c_fc.bias"), T, C, 4 * C);
+           param(layer, "mlp.c_fc.bias"), 1, C, 4 * C);
 
     for (float &h : hidden)
       h = gelu(h);
 
     linear(out.data(), hidden.data(), param(layer, "mlp.c_proj.weight"),
-           param(layer, "mlp.c_proj.bias"), T, 4 * C, C);
+           param(layer, "mlp.c_proj.bias"), 1, 4 * C, C);
 
     add_inplace(x, out);
   }
@@ -214,7 +213,72 @@ static int argmax(const std::vector<float> &v) {
   return std::max_element(v.begin(), v.end()) - v.begin();
 }
 
-int main() {
+static int sample(const std::vector<float> &logits, float temperature,
+                  int top_k, std::mt19937 &rng) {
+  if (temperature <= 0.0f)
+    return argmax(logits);
+
+  std::vector<std::pair<float, int>> candidates;
+  candidates.reserve(logits.size());
+  for (int i = 0; i < (int)logits.size(); i++) {
+    candidates.push_back({logits[i], i});
+  }
+  int k =
+      (top_k > 0 && top_k < (int)candidates.size() ? top_k
+                                                   : (int)candidates.size());
+  std::partial_sort(
+      candidates.begin(), candidates.begin() + k, candidates.end(),
+      [](const auto &a, const auto &b) { return a.first > b.first; });
+  candidates.resize(k);
+
+  const float max_logit = candidates[0].first;
+  std::vector<float> probs(k);
+  for (int i = 0; i < k; i++) {
+    probs[i] = std::exp((candidates[i].first - max_logit) / temperature);
+  }
+  std::discrete_distribution<int> pick(probs.begin(), probs.end());
+  return candidates[pick(rng)].second;
+}
+
+static const char *usage = "Usage: ./bin/main [options]\n"
+                           " -p TEXT    prompt\n"
+                           " -n N       number of tokens to generate\n"
+                           " --temp T   temperature\n"
+                           " --top-k K  sample from K most likely tokens\n";
+
+int main(int argc, char **argv) {
+  std::string prompt = "Hello world";
+  int n_new_tokens = 20000;
+  float temperature = 0.8f;
+  int top_k = 40;
+  unsigned seed = std::random_device{}();
+
+  for (int i = 1; i < argc; i++) {
+    std::string arg = argv[i];
+    auto value = [&]() -> std::string {
+      if (i + 1 >= argc) {
+        std::cerr << "missing value after " << arg << '\n';
+        std::exit(1);
+      }
+      return argv[++i];
+    };
+    if (arg == "-p" || arg == "--prompt")
+      prompt = value();
+    else if (arg == "-n")
+      n_new_tokens = std::stoi(value());
+    else if (arg == "--temp")
+      temperature = std::stof(value());
+    else if (arg == "--top-k")
+      top_k = std::stoi(value());
+    else if (arg == "-h" || arg == "--help") {
+      std::cout << usage;
+      return 1;
+    } else {
+      std::cerr << "unknown option: " << arg << '\n';
+      return 1;
+    }
+  }
+
   std::ifstream weight_file("./gpt2_weights.kestrel");
   if (!weight_file) {
     std::cerr << "could not open ./gpt2_weights.kestrel\n";
@@ -225,19 +289,34 @@ int main() {
 
   Tokenizer tok;
   if (!tok.load("./gpt2_tokenizer.kestrel")) {
-    std::cerr << "could not load ../gpt2_tokenizer.kestrel\n";
+    std::cerr << "could not load ./gpt2_tokenizer.kestrel\n";
     return 1;
   }
 
-  const std::string prompt = "Hello world";
-  int n_new_tokens = 20;
   std::vector<int> tokens = tok.encode(prompt);
+  if (tokens.empty()) {
+    std::cerr << "prompt is empty\n";
+    return 1;
+  }
   std::cout << prompt << std::flush;
 
+  KVCache cache;
+  std::vector<float> logits;
+  for (int pos = 0; pos < (int)tokens.size(); pos++) {
+    logits = model.step(tokens[pos], pos, cache);
+  }
+  std::mt19937 rng(seed);
+  constexpr int END_OF_TEXT = 50256;
+
   for (int i = 0; i < n_new_tokens; i++) {
-    int next = argmax(model.next_token_logits(tokens));
+    int next = sample(logits, temperature, top_k, rng);
+    if (next == END_OF_TEXT)
+      break;
+    if ((int)tokens.size() >= cfg::n_ctx)
+      break;
     tokens.push_back(next);
     std::cout << tok.decode({next}) << std::flush;
+    logits = model.step(next, tokens.size() - 1, cache);
   }
   std::cout << '\n';
   return 0;
