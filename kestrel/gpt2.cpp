@@ -150,10 +150,18 @@ public:
     std::vector<float> logits(V);
     for (int v = 0; v < V; v++) {
       const float *emb = wte + v * C;
-      float dot = 0.0f;
-      for (int c = 0; c < C; c++)
-        dot += normed[c] * emb[c];
-      logits[v] = dot;
+      float dot0 = 0.0f, dot1 = 0.0f, dot2 = 0.0f, dot3 = 0.0f;
+      int c;
+      for (c = 0; c + 3 < C; c += 4) {
+        dot0 += normed[c + 0] * emb[c + 0];
+        dot1 += normed[c + 1] * emb[c + 1];
+        dot2 += normed[c + 2] * emb[c + 2];
+        dot3 += normed[c + 3] * emb[c + 3];
+      }
+      for (; c < C; c++) {
+        dot0 += normed[c] * emb[c];
+      }
+      logits[v] = dot0 + dot1 + dot2 + dot3;
     }
     return logits;
   }
@@ -254,7 +262,7 @@ int main(int argc, char **argv) {
   };
 
   std::string prompt = "Hello world";
-  int n_new_tokens = 100;
+  int n_new_tokens = 20;
   float temperature = 0.8f;
   int top_k = 40;
   unsigned seed = std::random_device{}();
@@ -276,9 +284,11 @@ int main(int argc, char **argv) {
       temperature = std::stof(value());
     else if (arg == "--top-k")
       top_k = std::stoi(value());
-    else if (arg == "-h" || arg == "--help") {
+    else if (arg == "--seed") {
+      seed = std::stoul(value());
+    } else if (arg == "-h" || arg == "--help") {
       std::cout << usage;
-      return 1;
+      return 0;
     } else {
       std::cerr << "unknown option: " << arg << '\n';
       return 1;

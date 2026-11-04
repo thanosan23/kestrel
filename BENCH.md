@@ -17,8 +17,22 @@ Prompt: "Hello world"
 20 new tokens
 
 ### Optimizations
+Compiler optimizations: "-O3 -mcpu=native"
 KV Cache
 
 ### Timings
 Average: 1.76s   Fastest: 1.61s
 
+
+## Run 3
+### Settings
+Prompt: "Hello world"
+20 new tokens
+
+### Optimizations
+Compiler optimizations: "-O3 -mcpu=native"
+KV Cache
+Multiple accumulators
+
+### Timings 
+Average: 1.00s   Fastest: 0.92s
