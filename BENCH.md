@@ -36,3 +36,18 @@ Multiple accumulators
 
 ### Timings 
 Average: 1.00s   Fastest: 0.92s
+
+## Run 3
+### Settings
+Prompt: "Hello world"
+20 new tokens
+
+### Optimizations
+Compiler optimizations: "-O3 -mcpu=native"
+KV Cache
+Multiple accumulators
+Threads (8 threads)
+
+
+### Timings
+Average: 0.80s   Fastest: 0.72s

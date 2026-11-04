@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -11,6 +12,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -22,6 +24,32 @@ constexpr int head_dim = C / n_head;
 constexpr int n_ctx = 1024;
 constexpr int V = 50257;
 } // namespace cfg
+
+static int n_threads() {
+  static const int n = [] {
+    if (const char *env = std::getenv("KESTREL_THREADS")) {
+      return std::max(1, std::atoi(env));
+    }
+    return (int)std::max(1u, std::thread::hardware_concurrency());
+  }();
+  return n;
+}
+
+template <typename F> static void parallel_for(int n, F work) {
+  const int nt = std::min(n_threads(), n);
+  const int chunk = (n + nt - 1) / nt;
+  std::vector<std::thread> threads;
+  for (int i = 1; i < nt; i++) {
+    const int begin = i * chunk;
+    const int end = std::min(n, begin + chunk);
+    if (begin < end) {
+      threads.emplace_back(work, begin, end);
+    }
+  }
+  work(0, std::min(n, chunk));
+  for (auto &th : threads)
+    th.join();
+}
 
 // approximation from: https://arxiv.org/pdf/1606.08415
 static float gelu(float x) {
@@ -36,14 +64,16 @@ static void linear(float *out, const float *in, const float *W,
     const float *x = in + t * in_dim;
     float *y = out + t * out_dim;
 
-    for (int j = 0; j < out_dim; j++)
-      y[j] = bias[j];
+    parallel_for(out_dim, [&](int j0, int j1) {
+      for (int j = j0; j < j1; j++)
+        y[j] = bias[j];
 
-    for (int k = 0; k < in_dim; k++) {
-      const float *W_row = W + k * out_dim;
-      for (int j = 0; j < out_dim; j++)
-        y[j] += x[k] * W_row[j];
-    }
+      for (int k = 0; k < in_dim; k++) {
+        const float *W_row = W + k * out_dim;
+        for (int j = j0; j < j1; j++)
+          y[j] += x[k] * W_row[j];
+      }
+    });
   }
 }
 
@@ -149,21 +179,23 @@ public:
               1, C);
 
     std::vector<float> logits(V);
-    for (int v = 0; v < V; v++) {
-      const float *emb = wte + v * C;
-      float dot0 = 0.0f, dot1 = 0.0f, dot2 = 0.0f, dot3 = 0.0f;
-      int c;
-      for (c = 0; c + 3 < C; c += 4) {
-        dot0 += normed[c + 0] * emb[c + 0];
-        dot1 += normed[c + 1] * emb[c + 1];
-        dot2 += normed[c + 2] * emb[c + 2];
-        dot3 += normed[c + 3] * emb[c + 3];
+    parallel_for(V, [&](int v0, int v1) {
+      for (int v = v0; v < v1; v++) {
+        const float *emb = wte + v * C;
+        float dot0 = 0.0f, dot1 = 0.0f, dot2 = 0.0f, dot3 = 0.0f;
+        int c;
+        for (c = 0; c + 3 < C; c += 4) {
+          dot0 += normed[c + 0] * emb[c + 0];
+          dot1 += normed[c + 1] * emb[c + 1];
+          dot2 += normed[c + 2] * emb[c + 2];
+          dot3 += normed[c + 3] * emb[c + 3];
+        }
+        for (; c < C; c++) {
+          dot0 += normed[c] * emb[c];
+        }
+        logits[v] = dot0 + dot1 + dot2 + dot3;
       }
-      for (; c < C; c++) {
-        dot0 += normed[c] * emb[c];
-      }
-      logits[v] = dot0 + dot1 + dot2 + dot3;
-    }
+    });
     return logits;
   }
 
