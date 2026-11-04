@@ -2,6 +2,7 @@
 #include "tensor.hpp"
 #include "tokenizer.hpp"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <fstream>
 #include <iostream>
@@ -247,8 +248,13 @@ static const char *usage = "Usage: ./bin/main [options]\n"
                            " --top-k K  sample from K most likely tokens\n";
 
 int main(int argc, char **argv) {
+  using Clock = std::chrono::steady_clock;
+  auto seconds_since = [](Clock::time_point t) {
+    return std::chrono::duration<double>(Clock::now() - t).count();
+  };
+
   std::string prompt = "Hello world";
-  int n_new_tokens = 20000;
+  int n_new_tokens = 100;
   float temperature = 0.8f;
   int top_k = 40;
   unsigned seed = std::random_device{}();
@@ -285,7 +291,9 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  auto t0 = Clock::now();
   GPT2 model(IO::read_weights(weight_file));
+  double load_s = seconds_since(t0);
 
   Tokenizer tok;
   if (!tok.load("./gpt2_tokenizer.kestrel")) {
@@ -301,13 +309,17 @@ int main(int argc, char **argv) {
   std::cout << prompt << std::flush;
 
   KVCache cache;
+  auto t1 = Clock::now();
   std::vector<float> logits;
   for (int pos = 0; pos < (int)tokens.size(); pos++) {
     logits = model.step(tokens[pos], pos, cache);
   }
+  double prompt_s = seconds_since(t1);
+
   std::mt19937 rng(seed);
   constexpr int END_OF_TEXT = 50256;
-
+  auto t2 = Clock::now();
+  int generated = 0;
   for (int i = 0; i < n_new_tokens; i++) {
     int next = sample(logits, temperature, top_k, rng);
     if (next == END_OF_TEXT)
@@ -317,7 +329,18 @@ int main(int argc, char **argv) {
     tokens.push_back(next);
     std::cout << tok.decode({next}) << std::flush;
     logits = model.step(next, tokens.size() - 1, cache);
+    generated++;
   }
+  double gen_s = seconds_since(t2);
+
+  double tok_per_s = generated / gen_s;
+
   std::cout << '\n';
+
+  std::cerr << "\nload: " << load_s << "s\n"
+            << "prompt: " << prompt_s << "s (" << tokens.size() - generated
+            << " tokens)\n"
+            << "generation: " << tok_per_s << " tokens/sec\n";
+
   return 0;
 }
