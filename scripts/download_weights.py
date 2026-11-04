@@ -1,8 +1,8 @@
-from huggingface_hub import hf_hub_download
 import json
+from huggingface_hub import hf_hub_download
 import numpy as np
-import tqdm
 import struct
+import tqdm
 
 filepath = hf_hub_download(
     repo_id="openai-community/gpt2", filename="model.safetensors"
@@ -34,7 +34,7 @@ with open(filepath, "rb") as f:
         else:
             print(f"Unsupported datatype {dtype}")
 
-        data = np.frombuffer(data, dtype=dtype)
+        data = np.frombuffer(data, dtype=dtype).reshape(shape)
 
         weights[tensor_name] = data
 
