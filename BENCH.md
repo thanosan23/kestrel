@@ -37,7 +37,7 @@ Multiple accumulators
 ### Timings 
 Average: 1.00s   Fastest: 0.92s
 
-## Run 3
+## Run 4
 ### Settings
 Prompt: "Hello world"
 20 new tokens

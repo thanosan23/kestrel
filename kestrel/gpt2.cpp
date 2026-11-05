@@ -1,55 +1,9 @@
-#include "io.hpp"
-#include "tensor.hpp"
-#include "tokenizer.hpp"
+#include "gpt2.hpp"
+#include "config.hpp"
+#include "threadpool.hpp"
 #include <algorithm>
-#include <chrono>
 #include <cmath>
-#include <cstdlib>
-#include <fstream>
-#include <iostream>
-#include <map>
-#include <memory>
-#include <random>
 #include <stdexcept>
-#include <string>
-#include <thread>
-#include <utility>
-#include <vector>
-
-namespace cfg {
-constexpr int n_layer = 12;
-constexpr int n_head = 12;
-constexpr int C = 768;
-constexpr int head_dim = C / n_head;
-constexpr int n_ctx = 1024;
-constexpr int V = 50257;
-} // namespace cfg
-
-static int n_threads() {
-  static const int n = [] {
-    if (const char *env = std::getenv("KESTREL_THREADS")) {
-      return std::max(1, std::atoi(env));
-    }
-    return (int)std::max(1u, std::thread::hardware_concurrency());
-  }();
-  return n;
-}
-
-template <typename F> static void parallel_for(int n, F work) {
-  const int nt = std::min(n_threads(), n);
-  const int chunk = (n + nt - 1) / nt;
-  std::vector<std::thread> threads;
-  for (int i = 1; i < nt; i++) {
-    const int begin = i * chunk;
-    const int end = std::min(n, begin + chunk);
-    if (begin < end) {
-      threads.emplace_back(work, begin, end);
-    }
-  }
-  work(0, std::min(n, chunk));
-  for (auto &th : threads)
-    th.join();
-}
 
 // approximation from: https://arxiv.org/pdf/1606.08415
 static float gelu(float x) {
@@ -145,268 +99,84 @@ static void add_inplace(std::vector<float> &x, const std::vector<float> &y) {
   }
 }
 
-struct KVCache {
-  std::vector<std::vector<float>> k, v;
-  KVCache()
-      : k(cfg::n_layer, std::vector<float>(cfg::n_ctx * cfg::C)),
-        v(cfg::n_layer, std::vector<float>(cfg::n_ctx * cfg::C)) {}
-};
+std::vector<float> GPT2::step(int token, int pos, KVCache &cache) const {
+  using namespace cfg;
 
-class GPT2 {
-public:
-  explicit GPT2(std::map<std::string, Tensor> weights)
-      : weights(std::move(weights)) {};
+  if (pos >= n_ctx) {
+    throw std::runtime_error("context is full");
+  }
 
-  std::vector<float> step(int token, int pos, KVCache &cache) const {
-    using namespace cfg;
+  const float *wte = param("wte.weight");
+  const float *wpe = param("wpe.weight");
+  std::vector<float> x(C);
+  for (int c = 0; c < C; c++) {
+    x[c] = wte[token * C + c] + wpe[pos * C + c];
+  }
+  for (int layer = 0; layer < n_layer; layer++) {
+    transformer_block(layer, x, pos, cache);
+  }
 
-    if (pos >= n_ctx) {
-      throw std::runtime_error("context is full");
-    }
+  std::vector<float> normed(C);
+  layernorm(normed.data(), x.data(), param("ln_f.weight"), param("ln_f.bias"),
+            1, C);
 
-    const float *wte = param("wte.weight");
-    const float *wpe = param("wpe.weight");
-    std::vector<float> x(C);
-    for (int c = 0; c < C; c++) {
-      x[c] = wte[token * C + c] + wpe[pos * C + c];
-    }
-    for (int layer = 0; layer < n_layer; layer++) {
-      transformer_block(layer, x, pos, cache);
-    }
-
-    std::vector<float> normed(C);
-    layernorm(normed.data(), x.data(), param("ln_f.weight"), param("ln_f.bias"),
-              1, C);
-
-    std::vector<float> logits(V);
-    parallel_for(V, [&](int v0, int v1) {
-      for (int v = v0; v < v1; v++) {
-        const float *emb = wte + v * C;
-        float dot0 = 0.0f, dot1 = 0.0f, dot2 = 0.0f, dot3 = 0.0f;
-        int c;
-        for (c = 0; c + 3 < C; c += 4) {
-          dot0 += normed[c + 0] * emb[c + 0];
-          dot1 += normed[c + 1] * emb[c + 1];
-          dot2 += normed[c + 2] * emb[c + 2];
-          dot3 += normed[c + 3] * emb[c + 3];
-        }
-        for (; c < C; c++) {
-          dot0 += normed[c] * emb[c];
-        }
-        logits[v] = dot0 + dot1 + dot2 + dot3;
+  std::vector<float> logits(V);
+  parallel_for(V, [&](int v0, int v1) {
+    for (int v = v0; v < v1; v++) {
+      const float *emb = wte + v * C;
+      float dot0 = 0.0f, dot1 = 0.0f, dot2 = 0.0f, dot3 = 0.0f;
+      int c;
+      for (c = 0; c + 3 < C; c += 4) {
+        dot0 += normed[c + 0] * emb[c + 0];
+        dot1 += normed[c + 1] * emb[c + 1];
+        dot2 += normed[c + 2] * emb[c + 2];
+        dot3 += normed[c + 3] * emb[c + 3];
       }
-    });
-    return logits;
-  }
-
-private:
-  std::map<std::string, Tensor> weights;
-
-  const float *param(const std::string &name) const {
-    return weights.at(name).data.data();
-  }
-
-  const float *param(int layer, const std::string &name) const {
-    return param("h." + std::to_string(layer) + "." + name);
-  }
-
-  void transformer_block(int layer, std::vector<float> &x, int pos,
-                         KVCache &cache) const {
-    using namespace cfg;
-
-    std::vector<float> normed(C), qkv(3 * C), attn(C), hidden(4 * C), out(C);
-
-    layernorm(normed.data(), x.data(), param(layer, "ln_1.weight"),
-              param(layer, "ln_1.bias"), 1, C);
-
-    linear(qkv.data(), normed.data(), param(layer, "attn.c_attn.weight"),
-           param(layer, "attn.c_attn.bias"), 1, C, 3 * C);
-
-    float *K = cache.k[layer].data();
-    float *V = cache.v[layer].data();
-
-    std::copy(qkv.begin() + C, qkv.begin() + 2 * C, K + pos * C);
-    std::copy(qkv.begin() + 2 * C, qkv.end(), V + pos * C);
-
-    attention(attn.data(), qkv.data(), K, V, pos);
-
-    linear(out.data(), attn.data(), param(layer, "attn.c_proj.weight"),
-           param(layer, "attn.c_proj.bias"), 1, C, C);
-
-    add_inplace(x, out);
-
-    layernorm(normed.data(), x.data(), param(layer, "ln_2.weight"),
-              param(layer, "ln_2.bias"), 1, C);
-
-    linear(hidden.data(), normed.data(), param(layer, "mlp.c_fc.weight"),
-           param(layer, "mlp.c_fc.bias"), 1, C, 4 * C);
-
-    for (float &h : hidden)
-      h = gelu(h);
-
-    linear(out.data(), hidden.data(), param(layer, "mlp.c_proj.weight"),
-           param(layer, "mlp.c_proj.bias"), 1, 4 * C, C);
-
-    add_inplace(x, out);
-  }
-};
-
-static int argmax(const std::vector<float> &v) {
-  return std::max_element(v.begin(), v.end()) - v.begin();
+      for (; c < C; c++) {
+        dot0 += normed[c] * emb[c];
+      }
+      logits[v] = dot0 + dot1 + dot2 + dot3;
+    }
+  });
+  return logits;
 }
 
-static int sample(const std::vector<float> &logits, float temperature,
-                  int top_k, std::mt19937 &rng) {
-  if (temperature <= 0.0f)
-    return argmax(logits);
+void GPT2::transformer_block(int layer, std::vector<float> &x, int pos,
+                             KVCache &cache) const {
+  using namespace cfg;
 
-  std::vector<std::pair<float, int>> candidates;
-  candidates.reserve(logits.size());
-  for (int i = 0; i < (int)logits.size(); i++) {
-    candidates.push_back({logits[i], i});
-  }
+  std::vector<float> normed(C), qkv(3 * C), attn(C), hidden(4 * C), out(C);
 
-  int k =
-      (top_k > 0 && top_k < (int)candidates.size() ? top_k
-                                                   : (int)candidates.size());
-  std::partial_sort(
-      candidates.begin(), candidates.begin() + k, candidates.end(),
-      [](const auto &a, const auto &b) { return a.first > b.first; });
-  candidates.resize(k);
+  layernorm(normed.data(), x.data(), param(layer, "ln_1.weight"),
+            param(layer, "ln_1.bias"), 1, C);
 
-  const float max_logit = candidates[0].first;
-  std::vector<float> probs(k);
-  for (int i = 0; i < k; i++) {
-    probs[i] = std::exp((candidates[i].first - max_logit) / temperature);
-  }
+  linear(qkv.data(), normed.data(), param(layer, "attn.c_attn.weight"),
+         param(layer, "attn.c_attn.bias"), 1, C, 3 * C);
 
-  std::discrete_distribution<int> pick(probs.begin(), probs.end());
-  return candidates[pick(rng)].second;
-}
+  float *K = cache.k[layer].data();
+  float *V = cache.v[layer].data();
 
-static const char *usage =
-    "Usage: ./bin/main [options]\n"
-    " -p TEXT      prompt\n"
-    " -n N         number of tokens to generate\n"
-    " --temp T     temperature\n"
-    " --top-k K    sample from K most likely tokens\n"
-    " --dump FILE  save the prompt's token ids and logits"
-    " --help       prints usage\n";
+  std::copy(qkv.begin() + C, qkv.begin() + 2 * C, K + pos * C);
+  std::copy(qkv.begin() + 2 * C, qkv.end(), V + pos * C);
 
-int main(int argc, char **argv) {
-  using Clock = std::chrono::steady_clock;
-  auto seconds_since = [](Clock::time_point t) {
-    return std::chrono::duration<double>(Clock::now() - t).count();
-  };
+  attention(attn.data(), qkv.data(), K, V, pos);
 
-  std::string prompt = "Hello world";
-  int n_new_tokens = 20;
-  float temperature = 0.8f;
-  int top_k = 40;
-  unsigned seed = std::random_device{}();
-  std::string dump_path;
+  linear(out.data(), attn.data(), param(layer, "attn.c_proj.weight"),
+         param(layer, "attn.c_proj.bias"), 1, C, C);
 
-  for (int i = 1; i < argc; i++) {
-    std::string arg = argv[i];
-    auto value = [&]() -> std::string {
-      if (i + 1 >= argc) {
-        std::cerr << "missing value after " << arg << '\n';
-        std::exit(1);
-      }
-      return argv[++i];
-    };
-    if (arg == "-p" || arg == "--prompt")
-      prompt = value();
-    else if (arg == "-n")
-      n_new_tokens = std::stoi(value());
-    else if (arg == "--temp")
-      temperature = std::stof(value());
-    else if (arg == "--top-k")
-      top_k = std::stoi(value());
-    else if (arg == "--seed") {
-      seed = std::stoul(value());
-    } else if (arg == "--dump") {
-      dump_path = value();
+  add_inplace(x, out);
 
-    } else if (arg == "-h" || arg == "--help") {
-      std::cout << usage;
-      return 0;
-    } else {
-      std::cerr << "unknown option: " << arg << '\n';
-      return 1;
-    }
-  }
+  layernorm(normed.data(), x.data(), param(layer, "ln_2.weight"),
+            param(layer, "ln_2.bias"), 1, C);
 
-  std::ifstream weight_file("./gpt2_weights.kestrel");
-  if (!weight_file) {
-    std::cerr << "could not open ./gpt2_weights.kestrel\n";
-    return 1;
-  }
+  linear(hidden.data(), normed.data(), param(layer, "mlp.c_fc.weight"),
+         param(layer, "mlp.c_fc.bias"), 1, C, 4 * C);
 
-  auto t0 = Clock::now();
-  GPT2 model(IO::read_weights(weight_file));
-  double load_s = seconds_since(t0);
+  for (float &h : hidden)
+    h = gelu(h);
 
-  Tokenizer tok;
-  if (!tok.load("./gpt2_tokenizer.kestrel")) {
-    std::cerr << "could not load ./gpt2_tokenizer.kestrel\n";
-    return 1;
-  }
+  linear(out.data(), hidden.data(), param(layer, "mlp.c_proj.weight"),
+         param(layer, "mlp.c_proj.bias"), 1, 4 * C, C);
 
-  std::vector<int> tokens = tok.encode(prompt);
-  if (tokens.empty()) {
-    std::cerr << "prompt is empty\n";
-    return 1;
-  }
-  std::cout << prompt << std::flush;
-
-  KVCache cache;
-  auto t1 = Clock::now();
-  std::vector<float> logits;
-  for (int pos = 0; pos < (int)tokens.size(); pos++) {
-    logits = model.step(tokens[pos], pos, cache);
-  }
-  double prompt_s = seconds_since(t1);
-
-  if (!dump_path.empty()) {
-    std::ofstream dump(dump_path, std::ios::binary);
-
-    const int32_t n = tokens.size();
-    dump.write(reinterpret_cast<const char *>(&n), sizeof(n));
-    dump.write(reinterpret_cast<const char *>(tokens.data()), sizeof(int) * n);
-    dump.write(reinterpret_cast<const char *>(logits.data()),
-               logits.size() * sizeof(float));
-    if (!dump) {
-      std::cerr << "could not write " << dump_path << '\n';
-      return 1;
-    }
-  }
-
-  std::mt19937 rng(seed);
-  constexpr int END_OF_TEXT = 50256;
-  auto t2 = Clock::now();
-  int generated = 0;
-  for (int i = 0; i < n_new_tokens; i++) {
-    int next = sample(logits, temperature, top_k, rng);
-    if (next == END_OF_TEXT)
-      break;
-    if ((int)tokens.size() >= cfg::n_ctx)
-      break;
-    tokens.push_back(next);
-    std::cout << tok.decode({next}) << std::flush;
-    logits = model.step(next, tokens.size() - 1, cache);
-    generated++;
-  }
-  double gen_s = seconds_since(t2);
-
-  double tok_per_s = generated / gen_s;
-
-  std::cout << '\n';
-
-  std::cerr << "\nload: " << load_s << "s\n"
-            << "prompt: " << prompt_s << "s (" << tokens.size() - generated
-            << " tokens)\n"
-            << "generation: " << tok_per_s << " tokens/sec\n";
-
-  return 0;
+  add_inplace(x, out);
 }
