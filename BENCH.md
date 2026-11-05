@@ -8,7 +8,7 @@ Prompt: "Hello world"
 Compiler optimizations: "-O3 -mcpu=native"
 
 ### Timings
-Average: 3.99s   Fastest: 3.85s
+Generation: ~5 tok/s
 
 ## Run 2
 
@@ -21,7 +21,7 @@ Compiler optimizations: "-O3 -mcpu=native"
 KV Cache
 
 ### Timings
-Average: 1.76s   Fastest: 1.61s
+Generation: 16.3 tok/s
 
 
 ## Run 3
@@ -35,7 +35,7 @@ KV Cache
 Multiple accumulators
 
 ### Timings 
-Average: 1.00s   Fastest: 0.92s
+Generation: 30.7 tok/s
 
 ## Run 4
 ### Settings
@@ -46,10 +46,10 @@ Prompt: "Hello world"
 Compiler optimizations: "-O3 -mcpu=native"
 KV Cache
 Multiple accumulators
-Threads (8 threads)
+Threads (4 threads)
 
 ### Timings
-Average: 0.80s   Fastest: 0.72s
+Generation: 34.4 tok/s
 
 ## Run 5
 ### Settings
@@ -64,7 +64,7 @@ Threads (8 threads)
 Thread pool
 
 ### Timings
-Average: 0.75s   Fastest: 0.65s
+Generation: 55 tok/s
 
 ## Run 6
 ### Settings
@@ -80,4 +80,21 @@ Thread pool
 NEON SIMD
 
 ### Timings
-Average: 0.86s   Fastest: 0.73s
+Generation: ~50 tok/s
+
+## Run 6
+### Settings
+Prompt: "Hello world"
+20 new tokens
+
+### Optimizations
+Compiler optimizations: "-O3 -mcpu=native"
+KV Cache
+Multiple accumulators
+Threads (8 threads)
+Thread pool
+NEON SIMD
+INT weight-only quantization (per-row)
+
+### Timings
+Generation: ~88.9 tok/s
