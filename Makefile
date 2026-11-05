@@ -6,11 +6,11 @@ app: bin/main
 
 bin/main: kestrel/*.cpp kestrel/*.hpp
 	@mkdir -p bin
-	g++ -std=c++17 -Wall -pthread $(FLAGS) kestrel/*.cpp -o bin/main
+	KESTREL_THREADS=4 g++ -std=c++17 -Wall -pthread $(FLAGS) kestrel/*.cpp -o bin/main
 
 bench:
 	@mkdir -p bin
-	g++ -std=c++17 -Wall -pthread $(FLAGS) kestrel/*.cpp -o bin/bench
+	KESTREL_THREADS=4 g++ -std=c++17 -Wall -pthread $(FLAGS) kestrel/*.cpp -o bin/bench
 	@times=""; \
 	for i in 1 2 3; do \
 	  echo "--- Run $$i ---"; \

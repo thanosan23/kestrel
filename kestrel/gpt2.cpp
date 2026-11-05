@@ -2,6 +2,7 @@
 #include "config.hpp"
 #include "threadpool.hpp"
 #include <algorithm>
+#include <arm_neon.h>
 #include <cmath>
 #include <stdexcept>
 
@@ -10,6 +11,26 @@ static float gelu(float x) {
   const float sqrt_2_over_pi = 0.7978845608f;
   return 0.5f * x *
          (1.0f + std::tanh(sqrt_2_over_pi * (x + 0.044715f * x * x * x)));
+}
+
+static float dot(const float *a, const float *b, int n) {
+  float32x4_t acc0 = vdupq_n_f32(0.0f);
+  float32x4_t acc1 = vdupq_n_f32(0.0f);
+  float32x4_t acc2 = vdupq_n_f32(0.0f);
+  float32x4_t acc3 = vdupq_n_f32(0.0f);
+
+  int i = 0;
+  for (; i + 15 < n; i += 16) {
+    acc0 = vfmaq_f32(acc0, vld1q_f32(a + i + 0), vld1q_f32(b + i + 0));
+    acc1 = vfmaq_f32(acc1, vld1q_f32(a + i + 4), vld1q_f32(b + i + 4));
+    acc2 = vfmaq_f32(acc2, vld1q_f32(a + i + 8), vld1q_f32(b + i + 8));
+    acc3 = vfmaq_f32(acc3, vld1q_f32(a + i + 12), vld1q_f32(b + i + 12));
+  }
+  float32x4_t acc = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
+  float sum = vaddvq_f32(acc);
+  for (; i < n; i++)
+    sum += a[i] * b[i];
+  return sum;
 }
 
 static void linear(float *out, const float *in, const float *W,
@@ -65,11 +86,7 @@ static void attention(float *out, const float *q, const float *K,
     float max_score = -INFINITY;
     for (int t2 = 0; t2 <= pos; t2++) {
       const float *kh = K + t2 * C + h * head_dim;
-      float dot = 0.0f;
-      for (int i = 0; i < head_dim; i++) {
-        dot += qh[i] * kh[i];
-      }
-      probs[t2] = dot * scale;
+      probs[t2] = dot(qh, kh, head_dim) * scale;
       max_score = std::max(max_score, probs[t2]);
     }
 
@@ -123,19 +140,7 @@ std::vector<float> GPT2::step(int token, int pos, KVCache &cache) const {
   std::vector<float> logits(V);
   parallel_for(V, [&](int v0, int v1) {
     for (int v = v0; v < v1; v++) {
-      const float *emb = wte + v * C;
-      float dot0 = 0.0f, dot1 = 0.0f, dot2 = 0.0f, dot3 = 0.0f;
-      int c;
-      for (c = 0; c + 3 < C; c += 4) {
-        dot0 += normed[c + 0] * emb[c + 0];
-        dot1 += normed[c + 1] * emb[c + 1];
-        dot2 += normed[c + 2] * emb[c + 2];
-        dot3 += normed[c + 3] * emb[c + 3];
-      }
-      for (; c < C; c++) {
-        dot0 += normed[c] * emb[c];
-      }
-      logits[v] = dot0 + dot1 + dot2 + dot3;
+      logits[v] = dot(normed.data(), wte + v * C, C);
     }
   });
   return logits;
