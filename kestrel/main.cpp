@@ -125,10 +125,7 @@ int main(int argc, char **argv) {
 
   KVCache cache;
   auto t1 = Clock::now();
-  std::vector<float> logits;
-  for (int pos = 0; pos < (int)tokens.size(); pos++) {
-    logits = model.step(tokens[pos], pos, cache);
-  }
+  std::vector<float> logits = model.prefill(tokens, cache);
   double prompt_s = seconds_since(t1);
 
   if (!dump_path.empty()) {

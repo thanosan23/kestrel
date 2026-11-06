@@ -82,7 +82,7 @@ NEON SIMD
 ### Timings
 Generation: ~50 tok/s
 
-## Run 6
+## Run 7
 ### Settings
 Prompt: "Hello world"
 20 new tokens
@@ -98,3 +98,23 @@ INT weight-only quantization (per-row)
 
 ### Timings
 Generation: ~88.9 tok/s
+
+## Run 8
+### Settings
+Prompt: "Hello world"
+20 new tokens
+
+### Optimizations
+Compiler optimizations: "-O3 -mcpu=native"
+KV Cache
+Multiple accumulators
+Threads (8 threads)
+Thread pool
+NEON SIMD
+INT weight-only quantization (per-row)
+Batched Prefill
+
+### Timings
+Generation: ~90.51 tok/s
+Brought a 384-token prompt from 5.48s to 1.27s (4.3x)
+

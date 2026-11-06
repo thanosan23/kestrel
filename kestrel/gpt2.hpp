@@ -4,13 +4,14 @@
 #include "tensor.hpp"
 #include <map>
 #include <string>
-#include <utility>
 #include <vector>
 
 class GPT2 {
 public:
   explicit GPT2(std::map<std::string, Tensor> weights);
   std::vector<float> step(int token, int pos, KVCache &cache) const;
+  std::vector<float> prefill(const std::vector<int> &tokens,
+                             KVCache &cache) const;
 
 private:
   std::map<std::string, Tensor> weights;
@@ -34,4 +35,7 @@ private:
 
   void transformer_block(int layer, std::vector<float> &x, int pos,
                          KVCache &cache) const;
+
+  void transformer_block_batched(int layer, std::vector<float> &x, int T,
+                                 KVCache &cache) const;
 };

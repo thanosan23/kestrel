@@ -1,5 +1,6 @@
 #include "gpt2.hpp"
 #include "config.hpp"
+#include "kv_cache.hpp"
 #include "tensor.hpp"
 #include "threadpool.hpp"
 #include <algorithm>
@@ -70,8 +71,8 @@ static float dot_q(const float *a, const int8_t *b, int n) {
   int i = 0;
   for (; i + 15 < n; i += 16) {
     int8x16_t q = vld1q_s8(b + i);
-    int8x16_t lo = vmovl_s8(vget_low_s8(q));
-    int8x16_t hi = vmovl_s8(vget_high_s8(q));
+    int16x8_t lo = vmovl_s8(vget_low_s8(q));
+    int16x8_t hi = vmovl_s8(vget_high_s8(q));
     float32x4_t f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo)));
     float32x4_t f1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo)));
     float32x4_t f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi)));
@@ -88,17 +89,28 @@ static float dot_q(const float *a, const int8_t *b, int n) {
   return sum;
 }
 
-static void linear_q(float *y, const float *x, const QTensor &W,
-                     const float *bias, int in_dim, int out_dim) {
+static void linear_q(float *out, const float *in, const QTensor &W,
+                     const float *bias, int T, int in_dim, int out_dim) {
+  constexpr int TB = 8;
   parallel_for(out_dim, [&](int j0, int j1) {
-    for (int j = j0; j < j1; j++)
-      y[j] = bias[j];
-
-    for (int k = 0; k < in_dim; k++) {
-      const float xs = x[k] * W.scale[k];
-      const int8_t *q_row = W.q.data() + (size_t)k * out_dim;
-      for (int j = j0; j < j1; j++)
-        y[j] += xs * q_row[j];
+    for (int t0 = 0; t0 < T; t0 += TB) {
+      const int t1 = std::min(T, t0 + TB);
+      for (int t = t0; t < t1; t++) {
+        for (int j = j0; j < j1; j++) {
+          out[(size_t)t * out_dim + j] = bias[j];
+        }
+      }
+      for (int k = 0; k < in_dim; k++) {
+        const int8_t *q_row = W.q.data() + (size_t)k * out_dim;
+        const float s = W.scale[k];
+        for (int t = t0; t < t1; t++) {
+          const float xs = in[(size_t)t * in_dim + k] * s;
+          float *y = out + (size_t)t * out_dim;
+          for (int j = j0; j < j1; j++) {
+            y[j] += xs * q_row[j];
+          }
+        }
+      }
     }
   });
 }
@@ -184,6 +196,78 @@ GPT2::GPT2(std::map<std::string, Tensor> w) : weights(std::move(w)) {
   quantize("wte.weight", V, C);
 }
 
+std::vector<float> GPT2::prefill(const std::vector<int> &tokens,
+                                 KVCache &cache) const {
+  using namespace cfg;
+  const int T = tokens.size();
+  if (T == 0 || T > n_ctx) {
+    throw std::runtime_error("prompt must be between 1 to 1024 tokens");
+  }
+  const QTensor &wte = qparam("wte.weight");
+  const float *wpe = param("wpe.weight");
+
+  std::vector<float> x((size_t)T * C);
+  for (int t = 0; t < T; t++) {
+    const int8_t *tok_row = wte.q.data() + tokens[t] * C;
+    const float s = wte.scale[tokens[t]];
+    for (int c = 0; c < C; c++) {
+      x[(size_t)t * C + c] = tok_row[c] * s + wpe[t * C + c];
+    }
+  }
+  for (int layer = 0; layer < n_layer; layer++) {
+    transformer_block_batched(layer, x, T, cache);
+  }
+  std::vector<float> normed(C);
+  layernorm(normed.data(), x.data() + (size_t)(T - 1) * C, param("ln_f.weight"),
+            param("ln_f.bias"), 1, C);
+
+  std::vector<float> logits(V);
+  parallel_for(V, [&](int v0, int v1) {
+    for (int v = v0; v < v1; v++) {
+      logits[v] =
+          wte.scale[v] * dot_q(normed.data(), wte.q.data() + (size_t)v * C, C);
+    }
+  });
+  return logits;
+}
+
+void GPT2::transformer_block_batched(int layer, std::vector<float> &x, int T,
+                                     KVCache &cache) const {
+  using namespace cfg;
+  std::vector<float> normed((size_t)T * C), qkv((size_t)T * 3 * C),
+      attn((size_t)T * C), hidden((size_t)T * 4 * C), out((size_t)T * C);
+  layernorm(normed.data(), x.data(), param(layer, "ln_1.weight"),
+            param(layer, "ln_1.bias"), T, C);
+  linear_q(qkv.data(), normed.data(), qparam(layer, "attn.c_attn.weight"),
+           param(layer, "attn.c_attn.bias"), T, C, 3 * C);
+  float *K = cache.k[layer].data();
+  float *V = cache.v[layer].data();
+  for (int t = 0; t < T; t++) {
+    const float *row = qkv.data() + (size_t)t * 3 * C;
+    std::copy(row + C, row + 2 * C, K + (size_t)t * C);
+    std::copy(row + 2 * C, row + 3 * C, V + (size_t)t * C);
+  }
+  parallel_for(T, [&](int t0, int t1) {
+    for (int t = t0; t < t1; t++) {
+      attention(attn.data() + (size_t)t * C, qkv.data() + (size_t)t * 3 * C, K,
+                V, t);
+    }
+  });
+  linear_q(out.data(), attn.data(), qparam(layer, "attn.c_proj.weight"),
+           param(layer, "attn.c_proj.bias"), T, C, C);
+  add_inplace(x, out);
+
+  layernorm(normed.data(), x.data(), param(layer, "ln_2.weight"),
+            param(layer, "ln_2.bias"), T, C);
+  linear_q(hidden.data(), normed.data(), qparam(layer, "mlp.c_fc.weight"),
+           param(layer, "mlp.c_fc.bias"), T, C, 4 * C);
+  for (float &h : hidden)
+    h = gelu(h);
+  linear_q(out.data(), hidden.data(), qparam(layer, "mlp.c_proj.weight"),
+           param(layer, "mlp.c_proj.bias"), T, 4 * C, C);
+  add_inplace(x, out);
+}
+
 std::vector<float> GPT2::step(int token, int pos, KVCache &cache) const {
   using namespace cfg;
 
@@ -226,7 +310,7 @@ void GPT2::transformer_block(int layer, std::vector<float> &x, int pos,
             param(layer, "ln_1.bias"), 1, C);
 
   linear_q(qkv.data(), normed.data(), qparam(layer, "attn.c_attn.weight"),
-           param(layer, "attn.c_attn.bias"), C, 3 * C);
+           param(layer, "attn.c_attn.bias"), 1, C, 3 * C);
 
   float *K = cache.k[layer].data();
   float *V = cache.v[layer].data();
@@ -237,7 +321,7 @@ void GPT2::transformer_block(int layer, std::vector<float> &x, int pos,
   attention(attn.data(), qkv.data(), K, V, pos);
 
   linear_q(out.data(), attn.data(), qparam(layer, "attn.c_proj.weight"),
-           param(layer, "attn.c_proj.bias"), C, C);
+           param(layer, "attn.c_proj.bias"), 1, C, C);
 
   add_inplace(x, out);
 
@@ -245,13 +329,13 @@ void GPT2::transformer_block(int layer, std::vector<float> &x, int pos,
             param(layer, "ln_2.bias"), 1, C);
 
   linear_q(hidden.data(), normed.data(), qparam(layer, "mlp.c_fc.weight"),
-           param(layer, "mlp.c_fc.bias"), C, 4 * C);
+           param(layer, "mlp.c_fc.bias"), 1, C, 4 * C);
 
   for (float &h : hidden)
     h = gelu(h);
 
   linear_q(out.data(), hidden.data(), qparam(layer, "mlp.c_proj.weight"),
-           param(layer, "mlp.c_proj.bias"), 4 * C, C);
+           param(layer, "mlp.c_proj.bias"), 1, 4 * C, C);
 
   add_inplace(x, out);
 }
