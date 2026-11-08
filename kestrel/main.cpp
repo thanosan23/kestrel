@@ -107,7 +107,7 @@ int main(int argc, char **argv) {
   }
 
   auto t0 = Clock::now();
-  GPT2 model(IO::read_weights(weight_file));
+  GPT2 model(IO::read_weights(weight_file), gpt::small);
   double load_s = seconds_since(t0);
 
   Tokenizer tok;
@@ -123,9 +123,12 @@ int main(int argc, char **argv) {
   }
   std::cout << prompt << std::flush;
 
-  KVCache cache;
+  KVCache cache(model.config());
   auto t1 = Clock::now();
-  std::vector<float> logits = model.prefill(tokens, cache);
+  std::vector<float> logits;
+  for (int pos = 0; pos < (int)tokens.size(); pos++) {
+    logits = model.step(tokens[pos], pos, cache);
+  }
   double prompt_s = seconds_since(t1);
 
   if (!dump_path.empty()) {
@@ -150,7 +153,7 @@ int main(int argc, char **argv) {
     int next = sample(logits, temperature, top_k, rng);
     if (next == END_OF_TEXT)
       break;
-    if ((int)tokens.size() >= cfg::n_ctx)
+    if ((int)tokens.size() >= GPT2Config::n_ctx)
       break;
     tokens.push_back(next);
     std::cout << tok.decode({next}) << std::flush;
