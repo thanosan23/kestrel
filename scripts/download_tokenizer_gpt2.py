@@ -2,9 +2,9 @@ import json
 from huggingface_hub import hf_hub_download
 import struct
 
-vocab_filename = hf_hub_download(repo_id="openai-community/gpt2", filename="vocab.json")
+vocab_filename = hf_hub_download(repo_id="openai-community/gpt2-large", filename="vocab.json")
 merges_filename = hf_hub_download(
-    repo_id="openai-community/gpt2", filename="merges.txt"
+    repo_id="openai-community/gpt2-large", filename="merges.txt"
 )
 
 
@@ -49,7 +49,7 @@ with open(merges_filename, "r", encoding="utf-8") as f:
 
 byte_to_id = [encoder[byte_encoder[b]] for b in range(256)]
 
-with open("gpt2_tokenizer.kestrel", "wb") as f:
+with open("gpt2_large_tokenizer.kestrel", "wb") as f:
     f.write(b"KTOK")
     f.write(struct.pack("<I", 1))
     f.write(struct.pack("<I", len(id_to_token)))

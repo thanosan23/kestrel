@@ -82,8 +82,8 @@ float dot_q(const float *a, const int8_t *b, int n) {
   return sum;
 }
 
-void linear_q(float *out, const float *in, const QTensor &W,
-                     const float *bias, int T, int in_dim, int out_dim) {
+void linear_q(float *out, const float *in, const QTensor &W, const float *bias,
+              int T, int in_dim, int out_dim) {
   constexpr int TB = 8;
   parallel_for(out_dim, [&](int j0, int j1) {
     for (int t0 = 0; t0 < T; t0 += TB) {
@@ -109,7 +109,7 @@ void linear_q(float *out, const float *in, const QTensor &W,
 }
 
 void layernorm(float *out, const float *in, const float *gamma,
-                      const float *beta, int T, int C) {
+               const float *beta, int T, int C) {
   const float eps = 1e-5f;
   for (int t = 0; t < T; t++) {
     const float *x = in + t * C;
