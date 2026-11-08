@@ -6,6 +6,10 @@ LLM inference engine in C++
 - Loads GPT-2 weights from custom binary format
 - BPE tokenizer (compatible with GPT-2)
 - KV Cache
+- Threading & loop unrolling
+- NEON SIMD
+- Quantization
+- Speculative Decoding
 
 ## Building
 
