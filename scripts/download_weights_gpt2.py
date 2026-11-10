@@ -4,8 +4,10 @@ import numpy as np
 import struct
 import tqdm
 
+size = "large"
+
 filepath = hf_hub_download(
-    repo_id="openai-community/gpt2-large", filename="model.safetensors"
+    repo_id=f"openai-community/gpt2-{size}", filename="model.safetensors"
 )
 
 weights = {}
@@ -38,7 +40,7 @@ with open(filepath, "rb") as f:
 
         weights[tensor_name] = data
 
-with open("gpt2_large_weights.kestrel", "wb") as f:
+with open(f"gpt2_{size}_weights.kestrel", "wb") as f:
     f.write(struct.pack("I", len(weights)))
     for tensor_name, data in weights.items():
         tensor_name_bytes = tensor_name.encode()

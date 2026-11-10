@@ -13,3 +13,5 @@ void linear_q(float *out, const float *in, const QTensor &W, const float *bias,
 void layernorm(float *out, const float *in, const float *gamma,
                const float *beta, int T, int C);
 void add_inplace(std::vector<float> &x, const std::vector<float> &y);
+QTensor quantize_transposed(const std::vector<float> &w, int in_dim,
+                            int out_dim);

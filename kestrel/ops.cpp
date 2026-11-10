@@ -1,4 +1,5 @@
 #include "ops.hpp"
+#include "tensor.hpp"
 #include "threadpool.hpp"
 #include <algorithm>
 #include <arm_neon.h>
@@ -82,30 +83,178 @@ float dot_q(const float *a, const int8_t *b, int n) {
   return sum;
 }
 
+template <int NT>
+static void dot_q_rows(const float *x, int x_stride, const int8_t *w, int n,
+                       float *result) {
+  float32x4_t acc[NT][4];
+  for (int t = 0; t < NT; t++)
+    for (int c = 0; c < 4; c++)
+      acc[t][c] = vdupq_n_f32(0.0f);
+
+  int i = 0;
+  for (; i + 15 < n; i += 16) {
+    int8x16_t q = vld1q_s8(w + i);
+    int16x8_t lo = vmovl_s8(vget_low_s8(q));
+    int16x8_t hi = vmovl_s8(vget_high_s8(q));
+    float32x4_t f[4] = {
+        vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo))),
+        vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo))),
+        vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi))),
+        vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi))),
+    };
+    for (int t = 0; t < NT; t++) {
+      const float *xt = x + (size_t)t * x_stride + i;
+      for (int c = 0; c < 4; c++)
+        acc[t][c] = vfmaq_f32(acc[t][c], vld1q_f32(xt + 4 * c), f[c]);
+    }
+  }
+  for (int t = 0; t < NT; t++) {
+    float32x4_t a = vaddq_f32(vaddq_f32(acc[t][0], acc[t][1]),
+                              vaddq_f32(acc[t][2], acc[t][3]));
+    float sum = vaddvq_f32(a);
+    const float *xt = x + (size_t)t * x_stride;
+    for (int j = i; j < n; j++)
+      sum += xt[j] * w[j];
+    result[t] = sum;
+  }
+}
+
+constexpr int QBLOCK = 32;
+
+#if defined(__ARM_FEATURE_DOTPROD)
+template <int NT>
+static void dot_q8_rows(const int8_t *x, const float *xs, int x_stride,
+                        const int8_t *w, int n, float *result) {
+  const int nb = n / QBLOCK;
+  const int s_stride = x_stride / QBLOCK;
+  float32x4_t acc[NT];
+  for (int t = 0; t < NT; t++)
+    acc[t] = vdupq_n_f32(0.0f);
+
+  for (int b = 0; b < nb; b++) {
+    const int8x16_t w0 = vld1q_s8(w + b * QBLOCK);
+    const int8x16_t w1 = vld1q_s8(w + b * QBLOCK + 16);
+    for (int t = 0; t < NT; t++) {
+      const int8_t *xt = x + (size_t)t * x_stride + b * QBLOCK;
+      int32x4_t d = vdotq_s32(vdupq_n_s32(0), w0, vld1q_s8(xt));
+      d = vdotq_s32(d, w1, vld1q_s8(xt + 16));
+      acc[t] =
+          vfmaq_n_f32(acc[t], vcvtq_f32_s32(d), xs[(size_t)t * s_stride + b]);
+    }
+  }
+  for (int t = 0; t < NT; t++)
+    result[t] = vaddvq_f32(acc[t]);
+}
+
+static void quantize_activations(const float *in, int T, int n,
+                                 std::vector<int8_t> &q,
+                                 std::vector<float> &scale) {
+  const int nb = n / QBLOCK;
+  q.resize((size_t)T * n);
+  scale.resize((size_t)T * nb);
+  for (int t = 0; t < T; t++) {
+    for (int b = 0; b < nb; b++) {
+      const float *x = in + (size_t)t * n + b * QBLOCK;
+      int8_t *qx = q.data() + (size_t)t * n + b * QBLOCK;
+      float max_abs = 0.0f;
+      for (int i = 0; i < QBLOCK; i++)
+        max_abs = std::max(max_abs, std::fabs(x[i]));
+      const float s = max_abs > 0.0f ? max_abs / 127.0f : 1.0f;
+      const float inv = 1.0f / s;
+      for (int i = 0; i < QBLOCK; i++)
+        qx[i] = (int8_t)std::nearbyint(x[i] * inv);
+      scale[(size_t)t * nb + b] = s;
+    }
+  }
+}
+#endif
+static void dot_q_group(int nt, const float *x, int stride, const int8_t *w,
+                        int n, float *res) {
+  switch (nt) {
+  case 4:
+    dot_q_rows<4>(x, stride, w, n, res);
+    break;
+  case 3:
+    dot_q_rows<3>(x, stride, w, n, res);
+    break;
+  case 2:
+    dot_q_rows<2>(x, stride, w, n, res);
+    break;
+  default:
+    dot_q_rows<1>(x, stride, w, n, res);
+    break;
+  }
+}
+
+#if defined(__ARM_FEATURE_DOTPROD)
+static void dot_q8_group(int nt, const int8_t *x, const float *xs, int stride,
+                         const int8_t *w, int n, float *res) {
+  switch (nt) {
+  case 4:
+    dot_q8_rows<4>(x, xs, stride, w, n, res);
+    break;
+  case 3:
+    dot_q8_rows<3>(x, xs, stride, w, n, res);
+    break;
+  case 2:
+    dot_q8_rows<2>(x, xs, stride, w, n, res);
+    break;
+  default:
+    dot_q8_rows<1>(x, xs, stride, w, n, res);
+    break;
+  }
+}
+#endif
+
 void linear_q(float *out, const float *in, const QTensor &W, const float *bias,
               int T, int in_dim, int out_dim) {
-  constexpr int TB = 8;
-  parallel_for(out_dim, [&](int j0, int j1) {
+  constexpr int TB = 32;
+
+#if defined(__ARM_FEATURE_DOTPROD)
+  const bool use_sdot = in_dim % QBLOCK == 0;
+  static thread_local std::vector<int8_t> qx;
+  static thread_local std::vector<float> sx;
+  if (use_sdot)
+    quantize_activations(in, T, in_dim, qx, sx);
+  const int nb = in_dim / QBLOCK;
+  const int8_t *qx_data = qx.data();
+  const float *sx_data = sx.data();
+#endif
+
+  parallel_for(out_dim, [&](int r0, int r1) {
     for (int t0 = 0; t0 < T; t0 += TB) {
       const int t1 = std::min(T, t0 + TB);
-      for (int t = t0; t < t1; t++) {
-        for (int j = j0; j < j1; j++) {
-          out[(size_t)t * out_dim + j] = bias[j];
-        }
-      }
-      for (int k = 0; k < in_dim; k++) {
-        const int8_t *q_row = W.q.data() + (size_t)k * out_dim;
-        const float s = W.scale[k];
-        for (int t = t0; t < t1; t++) {
-          const float xs = in[(size_t)t * in_dim + k] * s;
-          float *y = out + (size_t)t * out_dim;
-          for (int j = j0; j < j1; j++) {
-            y[j] += xs * q_row[j];
-          }
+      for (int r = r0; r < r1; r++) {
+        const int8_t *w = W.q.data() + (size_t)r * in_dim;
+        const float s = W.scale[r];
+        const float b = bias ? bias[r] : 0.0f;
+        for (int t = t0; t < t1; t += 4) {
+          const int nt = std::min(4, t1 - t);
+          float res[4];
+#if defined(__ARM_FEATURE_DOTPROD)
+          if (use_sdot)
+            dot_q8_group(nt, qx_data + (size_t)t * in_dim,
+                         sx_data + (size_t)t * nb, in_dim, w, in_dim, res);
+          else
+#endif
+            dot_q_group(nt, in + (size_t)t * in_dim, in_dim, w, in_dim, res);
+          for (int u = 0; u < nt; u++)
+            out[(size_t)(t + u) * out_dim + r] = s * res[u] + b;
         }
       }
     }
   });
+}
+
+QTensor quantize_transposed(const std::vector<float> &w, int in_dim,
+                            int out_dim) {
+  std::vector<float> t((size_t)in_dim * out_dim);
+  for (int i = 0; i < in_dim; i++) {
+    for (int o = 0; o < out_dim; o++) {
+      t[(size_t)o * in_dim + i] = w[(size_t)i * out_dim + o];
+    }
+  }
+  return quantize_rows(t, out_dim, in_dim);
 }
 
 void layernorm(float *out, const float *in, const float *gamma,

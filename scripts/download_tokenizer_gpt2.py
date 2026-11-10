@@ -2,11 +2,12 @@ import json
 from huggingface_hub import hf_hub_download
 import struct
 
-vocab_filename = hf_hub_download(repo_id="openai-community/gpt2-large", filename="vocab.json")
-merges_filename = hf_hub_download(
-    repo_id="openai-community/gpt2-large", filename="merges.txt"
-)
+size = "large"
 
+vocab_filename = hf_hub_download(repo_id=f"openai-community/gpt2-{size}", filename="vocab.json")
+merges_filename = hf_hub_download(
+    repo_id=f"openai-community/gpt2-{size}", filename="merges.txt"
+)
 
 def bytes_to_unicode():
     bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
@@ -19,7 +20,6 @@ def bytes_to_unicode():
             n += 1
     return {b: chr(c) for b, c in zip(bs, cs)}
 
-
 byte_encoder = bytes_to_unicode()
 byte_decoder = {v: k for k, v in byte_encoder.items()}
 
@@ -31,10 +31,8 @@ id_to_token = [None] * len(encoder)
 for tok, i in encoder.items():
     id_to_token[i] = tok
 
-
 def token_bytes(tok):
     return bytes(byte_decoder[c] for c in tok)
-
 
 merges = []
 
@@ -49,7 +47,7 @@ with open(merges_filename, "r", encoding="utf-8") as f:
 
 byte_to_id = [encoder[byte_encoder[b]] for b in range(256)]
 
-with open("gpt2_large_tokenizer.kestrel", "wb") as f:
+with open(f"gpt2_{size}_tokenizer.kestrel", "wb") as f:
     f.write(b"KTOK")
     f.write(struct.pack("<I", 1))
     f.write(struct.pack("<I", len(id_to_token)))

@@ -59,19 +59,22 @@ GPT2::GPT2(std::map<std::string, Tensor> w, const GPT2Config &config)
     throw std::runtime_error("weights don't match the GPT2Config");
   }
 
-  auto quantize = [&](const std::string &name, int rows, int cols) {
-    qweights[name] = quantize_rows(weights.at(name).data, rows, cols);
+  auto quantize_linear = [&](const std::string &name, int in_dim, int out_dim) {
+    qweights[name] =
+        quantize_transposed(weights.at(name).data, in_dim, out_dim);
     weights.erase(name);
   };
 
   for (int layer = 0; layer < n_layer; layer++) {
     std::string p = "h." + std::to_string(layer) + ".";
-    quantize(p + "attn.c_attn.weight", C, 3 * C);
-    quantize(p + "attn.c_proj.weight", C, C);
-    quantize(p + "mlp.c_fc.weight", C, 4 * C);
-    quantize(p + "mlp.c_proj.weight", 4 * C, C);
+    quantize_linear(p + "attn.c_attn.weight", C, 3 * C);
+    quantize_linear(p + "attn.c_proj.weight", C, C);
+    quantize_linear(p + "mlp.c_fc.weight", C, 4 * C);
+    quantize_linear(p + "mlp.c_proj.weight", 4 * C, C);
   }
-  quantize("wte.weight", GPT2Config::V, C);
+  qweights["wte.weight"] =
+      quantize_rows(weights.at("wte.weight").data, GPT2Config::V, C);
+  weights.erase("wte.weight");
 }
 
 std::vector<float> GPT2::forward(const std::vector<int> &tokens, KVCache &cache,
@@ -113,17 +116,8 @@ std::vector<float> GPT2::forward(const std::vector<int> &tokens, KVCache &cache,
   layernorm(normed.data(), x.data() + (size_t)first * C, param("ln_f.weight"),
             param("ln_f.bias"), R, C);
 
-  std::vector<float> logits(R * V);
-  parallel_for(V, [&](int v0, int v1) {
-    for (int v = v0; v < v1; v++) {
-      const int8_t *row = wte.q.data() + (size_t)v * C;
-      const float s = wte.scale[v];
-      for (int r = 0; r < R; r++) {
-        logits[(size_t)r * V + v] =
-            s * dot_q(normed.data() + (size_t)r * C, row, C);
-      }
-    }
-  });
+  std::vector<float> logits((size_t)R * V);
+  linear_q(logits.data(), normed.data(), wte, nullptr, R, C, V);
   return logits;
 }
 
